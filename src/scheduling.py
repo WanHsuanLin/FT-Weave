@@ -47,7 +47,6 @@ def write_execution_log(
         )
     )
 
-
 def write_injection_log(
     execution_log: list,
     start_time: int,
@@ -78,31 +77,14 @@ def write_injection_log(
         qubit,
     )
 
-
-def assign_factory(
-    qubit_trackers: dict[int, QubitAngleTracker], factory_pool: FactoryPool, queue: list
-):
-    idle_factories = factory_pool.get_idle_factories()
-    for factory in idle_factories:
-        assert factory.angle is None
-
-        # Pop angle from primary queue, or secondary if primary is empty
-        if not queue:
-            return
-        generation, success_rate, theta, qubit = heapq.heappop(queue)
-
-        # Assign this angle to the factory object
-        factory_pool.assign_factory(factory.id, theta, qubit, success_rate)
-        qubit_trackers[qubit].add_factory(factory.id, theta)
-
-
-def construct_secondary_queue(
+def add_lookahead_into_queue(
     qubit_trackers: dict[int, QubitAngleTracker],
-    successful_qubits: set,
+    successful_qubits: set[int],
     lookahead_level: int,
     lookahead_threshold: int,
-) -> list:
-    secondary_queue = []
+    primary_queue: list[tuple[int, float, float, int]],
+) -> None:
+    
     for qubit, tracker in qubit_trackers.items():
         if qubit in successful_qubits:
             continue
@@ -121,28 +103,28 @@ def construct_secondary_queue(
                 # Add (LOOKAHEAD_THRESHOLD - current_count) copies to queue
                 for _ in range(lookahead_threshold - current_count):
                     heapq.heappush(
-                        secondary_queue,
+                        primary_queue,
                         (generation, success_rate, current_angle, qubit),
                     )
 
             # Move to next doubling level
             current_angle *= 2
-    return secondary_queue
 
 
 # ============================================================================
 # MAIN EXECUTION FUNCTION
 # ============================================================================
 
-
-def phase_1_assign_factories(
-    qubit_trackers,
-    factory_pool,
-    primary_queue,
-    successful_qubits,
-) -> None:
+# TODO1
+def get_angles_for_preparation(
+    qubit_trackers: dict[int, QubitAngleTracker],
+    factory_pool: FactoryPool,
+    primary_queue: list[tuple[int, float, float, int]], #<--- might change name
+    successful_qubits: set[int],
+) -> list[tuple[int, float, float]]:
     """
-    PHASE 1: Assign idle factories to prepare angles.
+    Generate K angles to prepare in one batch based on the level, where K is the number
+    of available factories.
 
     Args:
         qubit_trackers: Dict mapping qubit_id -> QubitAngleTracker
@@ -151,44 +133,58 @@ def phase_1_assign_factories(
         successful_qubits: Set of successfully completed qubit IDs
 
     Returns:
-        Updated factory_pool
-    """
-    assign_factory(qubit_trackers, factory_pool, primary_queue)
-
-    # Build lookahead queue based on current state
-    # Priority: (generation, success_rate, angle, qubit)
-    # Process all gen 0 first, then all gen 1, then all gen 2, etc.
-    # Within same generation, larger angles first
-    lookahead_level = LOOKAHEAD_LEVEL
-    lookahead_threshold = LOOKAHEAD_THRESHOLD
-    while factory_pool.get_num_idle_factories() > 0:
-        secondary_queue = construct_secondary_queue(
-            qubit_trackers, successful_qubits, lookahead_level, lookahead_threshold
-        )
-        assign_factory(qubit_trackers, factory_pool, secondary_queue)
-        lookahead_level += 1
-        lookahead_threshold += 1
-
-
-# TODO1
-def get_angles_for_preparation() -> list[tuple[int, float, float]]:
-    """
-    Generate K angles to prepare in one batch based on the level, where K is the number
-    of available factories.
-
-    Args:
-
-
-    Returns:
         batch_angles: List of (target_qubit, angle, success_rate)
     """
-    batch_angles = []
-    raise NotImplementedError("get_angles_for_preparation is not implemented yet.")
+    batch_angles: list[tuple[int, float, float]] = []
+
+    k_idle = factory_pool.get_num_idle_factories()
+    if k_idle == 0:
+        return batch_angles
+    
+    seen_qubits = set()
+    temp = []
+    while k_idle > 0 and primary_queue:
+        gen, success_rate, theta, qubit = heapq.heappop(primary_queue)
+        if qubit in successful_qubits:
+            continue
+        tracker = qubit_trackers[qubit]
+        #makes sure only each qubit at same angle is prepared for other lookaheads
+        if qubit not in seen_qubits and theta == tracker.target_angle:
+            batch_angles.append((qubit, theta, success_rate))
+            seen_qubits.add(qubit)
+            k_idle -= 1
+        else:
+            temp.append((gen, success_rate, theta, qubit))    
+
+    for item in temp:
+        heapq.heappush(primary_queue, item) 
+    if k_idle > 0:
+        lookahead_level = LOOKAHEAD_LEVEL
+        lookahead_threshold = LOOKAHEAD_THRESHOLD
+        add_lookahead_into_queue(
+            qubit_trackers,
+            successful_qubits,
+            lookahead_level,
+            lookahead_threshold,
+            primary_queue,
+        )
+        # goes through primary q k times to grab the batch angles
+        while k_idle > 0 and primary_queue:
+            generation, success_rate, theta, qubit = heapq.heappop(primary_queue)
+            if qubit in successful_qubits:
+                continue
+            tracker = qubit_trackers[qubit]
+            if theta < tracker.target_angle:
+                continue
+            batch_angles.append((qubit, theta, success_rate))
+            k_idle -= 1
     return batch_angles
 
 
 def assign_factories_for_batch(
     batch_angles: list[tuple[int, float, float]],
+    qubit_trackers: dict[int, QubitAngleTracker],
+    factory_pool: FactoryPool,
 ) -> list[tuple[float, int, float]]:
     """
     Assign factories to prepare the given batch of angles.
@@ -200,8 +196,14 @@ def assign_factories_for_batch(
         factory_assignments: List of (angle, qubit, success_rate) for each factory
     """
     # TODO1: now you can do a trivial assignment based on the indices. I will update this function later
-    factory_assignments = []
-    raise NotImplementedError("assign_factories is not implemented yet.")
+    factory_assignments: list[tuple[float, int, float]] = []
+    idle_factories = factory_pool.get_idle_factories()
+
+    for (qubit, angle, success_rate), factory in zip(batch_angles, idle_factories):
+        factory_pool.assign_factory(factory.id, angle, qubit, success_rate)
+        qubit_trackers[qubit].add_factory(factory.id, angle)
+        factory_assignments.append((angle, qubit, success_rate))
+    
     assert len(batch_angles) == len(factory_assignments)
     return factory_assignments
 
@@ -516,16 +518,18 @@ def factory_angle_execution(n_factories, target_qubits_angles):
     # ========================================================================
 
     while len(target_qubits_angles) > len(successful_qubits):
-        # PHASE 1: Assign idle factories to prepare angles
-        phase_1_assign_factories(
+        # PHASE 1: Deicde which angles to prepare then assign idle factories
+        batch_angles = get_angles_for_preparation(
             qubit_trackers,
             factory_pool,
             primary_queue,
             successful_qubits,
         )
-        # TODO1: change phase_1_assign_factories to
-        # batch_angles = get_angles_for_preparation()
-        # factory_assignments = assign_factories_for_batch(batch_angles)
+        assign_factories_for_batch(
+            batch_angles,
+            qubit_trackers,
+            factory_pool
+        )
 
         # PHASE 2: Execute TMR preparation
         circuit_moment, execution_log = phase_2_execute_tmr_preparation(
@@ -576,7 +580,6 @@ def factory_angle_execution(n_factories, target_qubits_angles):
             execution_log,
             primary_queue,
         )
-
         # Add time for injection attempts (CNOT + SE per injection)
         circuit_moment += max_injections_this_round * (CNOT_TIME + SE_TIME)
         execution_log.append(
